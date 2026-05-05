@@ -25,16 +25,54 @@ app.use(function (req, res, next) {
 
 app.use("/auth", authRouter);
 
-// --- МАРШРУТИ ДЛЯ НОТАТОК (CRUD) ---
+// --- МАРШРУТИ ДЛЯ НОТАТОК (ОНОВЛЕНО ДЛЯ ЛАБ №4) ---
 
-// 1. Отримати всі нотатки користувача
+// 1. Отримати список нотаток (Фільтрація, Пошук, Сортування, Пагінація)
 app.get("/notes", requireAuth, async (req, res) => {
     try {
-        const result = await pool.query("SELECT * FROM notes WHERE user_id = $1 ORDER BY id DESC", [req.session.userId]);
+        const userId = req.session.userId;
+        
+        // Отримуємо параметри з посилання (query params)
+        let { search = '', period = 'all', sort = 'newest', page = 1, limit = 10 } = req.query;
+
+        // Нормалізація значень (вимога лаби)
+        page = Math.max(1, parseInt(page) || 1);
+        limit = [5, 10, 20, 50].includes(parseInt(limit)) ? parseInt(limit) : 10;
+        const offset = (page - 1) * limit;
+
+        // Базовий SQL запит (Ізоляція по user_id)
+        let queryText = `SELECT * FROM notes WHERE user_id = $1`;
+        let queryParams = [userId];
+
+        // Додаємо пошук по title та content (в твоєму коді поле називається content)
+        if (search) {
+            queryParams.push(`%${search}%`);
+            queryText += ` AND (title ILIKE $${queryParams.length} OR content ILIKE $${queryParams.length})`;
+        }
+
+        // Додаємо фільтр за періодом
+        if (period === '7d') {
+            queryText += ` AND created_at > NOW() - INTERVAL '7 days'`;
+        } else if (period === '30d') {
+            queryText += ` AND created_at > NOW() - INTERVAL '30 days'`;
+        }
+
+        // Додаємо сортування
+        const sortOrder = sort === 'oldest' ? 'ASC' : 'DESC';
+        queryText += ` ORDER BY created_at ${sortOrder}`;
+
+        // Додаємо пагінацію
+        queryParams.push(limit, offset);
+        queryText += ` LIMIT $${queryParams.length - 1} OFFSET $${queryParams.length}`;
+
+        const result = await pool.query(queryText, queryParams);
+
+        // Малюємо форму фільтрів та список (Дизайн згідно ТЗ)
         let notesHtml = result.rows.map(n => `
             <div style="border: 1px solid #ccc; padding: 10px; margin-bottom: 10px;">
                 <h3>${n.title}</h3>
                 <p>${n.content}</p>
+                <small>${n.created_at.toLocaleString()}</small>
                 <form action="/notes/${n.id}/delete" method="POST" style="display:inline;">
                     <button type="submit" style="color:red;">Видалити</button>
                 </form>
@@ -43,16 +81,81 @@ app.get("/notes", requireAuth, async (req, res) => {
 
         res.send(`
             <h1>Ваші нотатки, ${req.session.username}</h1>
-            <a href="/notes/new">+ Додати нову нотатку</a> | <a href="/">На головну</a>
+            
+            <form action="/notes" method="GET" style="background: #f4f4f4; padding: 15px; margin-bottom: 20px;">
+                <input type="text" name="search" placeholder="Пошук..." value="${search}">
+                <select name="period">
+                    <option value="all" ${period === 'all' ? 'selected' : ''}>За весь час</option>
+                    <option value="7d" ${period === '7d' ? 'selected' : ''}>Останні 7 днів</option>
+                    <option value="30d" ${period === '30d' ? 'selected' : ''}>Останні 30 днів</option>
+                </select>
+                <select name="sort">
+                    <option value="newest" ${sort === 'newest' ? 'selected' : ''}>Нові спочатку</option>
+                    <option value="oldest" ${sort === 'oldest' ? 'selected' : ''}>Старі спочатку</option>
+                </select>
+                <select name="limit">
+                    <option value="5" ${limit === 5 ? 'selected' : ''}>5</option>
+                    <option value="10" ${limit === 10 ? 'selected' : ''}>10</option>
+                    <option value="20" ${limit === 20 ? 'selected' : ''}>20</option>
+                </select>
+                <button type="submit">Apply</button>
+                <a href="/notes">Reset</a>
+            </form>
+
+            <a href="/notes/new">+ Додати нову нотатку</a> | 
+            <a href="/notes/export.csv?search=${search}&period=${period}&sort=${sort}">Export CSV 📥</a> |
+            <a href="/">На головну</a>
             <hr>
-            ${notesHtml || "<p>У вас ще немає нотаток.</p>"}
+
+            ${notesHtml || "<p>Нічого не знайдено.</p>"}
+
+            <div style="margin-top: 20px;">
+                <a href="/notes?page=${page - 1}&limit=${limit}&search=${search}&period=${period}&sort=${sort}" ${page <= 1 ? 'style="pointer-events: none; color: gray;"' : ''}>Prev</a>
+                <span> Сторінка ${page} </span>
+                <a href="/notes?page=${page + 1}&limit=${limit}&search=${search}&period=${period}&sort=${sort}">Next</a>
+            </div>
         `);
     } catch (err) {
-        res.status(500).send("Помилка завантаження нотаток: " + err.message);
+        res.status(500).send("Помилка завантаження: " + err.message);
     }
 });
 
-// 2. Форма створення нотатки
+// 2. Експорт у CSV
+app.get("/notes/export.csv", requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.userId;
+        let { search = '', period = 'all', sort = 'newest' } = req.query;
+
+        let queryText = `SELECT title, content, created_at FROM notes WHERE user_id = $1`;
+        let queryParams = [userId];
+
+        if (search) {
+            queryParams.push(`%${search}%`);
+            queryText += ` AND (title ILIKE $${queryParams.length} OR content ILIKE $${queryParams.length})`;
+        }
+        if (period === '7d') queryText += ` AND created_at > NOW() - INTERVAL '7 days'`;
+        if (period === '30d') queryText += ` AND created_at > NOW() - INTERVAL '30 days'`;
+        
+        const sortOrder = sort === 'oldest' ? 'ASC' : 'DESC';
+        queryText += ` ORDER BY created_at ${sortOrder}`;
+
+        const result = await pool.query(queryText, queryParams);
+
+        // Формуємо CSV контент
+        let csv = "Title,Content,Date\n";
+        result.rows.forEach(r => {
+            csv += `"${r.title.replace(/"/g, '""')}","${r.content.replace(/"/g, '""')}","${r.created_at.toISOString()}"\n`;
+        });
+
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', 'attachment; filename=notes.csv');
+        res.status(200).send(csv);
+    } catch (err) {
+        res.status(500).send("Помилка експорту");
+    }
+});
+
+// 3. Форма створення нотатки
 app.get("/notes/new", requireAuth, (req, res) => {
     res.send(`
         <h1>Нова нотатка</h1>
@@ -65,7 +168,7 @@ app.get("/notes/new", requireAuth, (req, res) => {
     `);
 });
 
-// 3. Збереження нової нотатки
+// 4. Збереження нової нотатки
 app.post("/notes", requireAuth, async (req, res) => {
     const { title, content } = req.body;
     try {
@@ -76,7 +179,7 @@ app.post("/notes", requireAuth, async (req, res) => {
     }
 });
 
-// 4. Видалення нотатки
+// 5. Видалення нотатки
 app.post("/notes/:id/delete", requireAuth, async (req, res) => {
     try {
         await pool.query("DELETE FROM notes WHERE id = $1 AND user_id = $2", [req.params.id, req.session.userId]);
@@ -86,7 +189,8 @@ app.post("/notes/:id/delete", requireAuth, async (req, res) => {
     }
 });
 
-// --- ГОЛОВНА СТОРІНКА ---
+// --- ІНШІ МАРШРУТИ (БЕЗ ЗМІН) ---
+
 app.get("/", requireAuth, function (req, res) {
     res.send(`
         <h1>Вітаємо, ${req.session.username}!</h1>
