@@ -4,11 +4,75 @@ const pgSession = require("connect-pg-simple")(session);
 const pool = require("./db");
 const { authRouter, requireAuth } = require("./auth");
 
+// --- ПІДКЛЮЧЕННЯ МОДУЛІВ ДЛЯ ЛАБИ №6 ---
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs').promises; // Для роботи з файлами (читання JSON та видалення старих аватарок)
+
 const app = express();
 const PORT = 3000;
 
+// ==========================================
+// НАЛАШТУВАННЯ MULTER ДЛЯ АВАТАРОК
+// ==========================================
+const avatarStorage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, 'uploads/avatars/');
+    },
+    filename: (req, file, cb) => {
+        const ext = path.extname(file.originalname);
+        cb(null, `${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`);
+    }
+});
+
+const avatarFilter = (req, file, cb) => {
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp'];
+    if (allowedTypes.includes(file.mimetype)) {
+        cb(null, true);
+    } else {
+        cb(new Error('Недопустимий формат файлу! Дозволено лише JPEG, PNG та WebP.'), false);
+    }
+};
+
+const uploadAvatar = multer({
+    storage: avatarStorage,
+    limits: { fileSize: 2 * 1024 * 1024 }, // Обмеження 2 МБ
+    fileFilter: avatarFilter
+});
+
+// ==========================================
+// НАЛАШТУВАННЯ MULTER ДЛЯ ІМПОРТУ JSON
+// ==========================================
+const importStorage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, 'uploads/imports/');
+    },
+    filename: (req, file, cb) => {
+        cb(null, `import-${Date.now()}-${file.originalname}`);
+    }
+});
+
+const importFilter = (req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (ext === '.json') {
+        cb(null, true);
+    } else {
+        cb(new Error('Помилка: Дозволено завантажувати лише файли формату JSON!'), false);
+    }
+};
+
+const uploadImport = multer({
+    storage: importStorage,
+    limits: { fileSize: 1 * 1024 * 1024 }, // Обмеження 1 МБ
+    fileFilter: importFilter
+});
+
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Робимо папку uploads доступною для браузера (статичний маршрут)
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 app.use(session({
   store: new pgSession({ pool: pool, createTableIfMissing: true }),
@@ -25,9 +89,214 @@ app.use(function (req, res, next) {
 
 app.use("/auth", authRouter);
 
-// --- МАРШРУТИ ДЛЯ НОТАТОК ---
 
-// 1. СТАТИСТИКА (Лабораторна №5)
+// ==========================================
+// ЛАБА №6: МАРШРУТИ ДЛЯ АВАТАРОК КОРИСТУВАЧА
+// ==========================================
+
+// 1. СТОРИНКА ПРОФІЛЮ (Відображення даних та аватара)
+app.get("/profile", requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.userId;
+        const result = await pool.query("SELECT email, avatar FROM users WHERE id = $1", [userId]);
+        const user = result.rows[0];
+
+        const avatarHtml = user.avatar 
+            ? `<img src="/uploads/avatars/${user.avatar}" alt="Avatar" style="width:150px; height:150px; border-radius:50%; object-fit:cover; border: 2px solid #ccc;"><br>`
+            : `<div style="width:150px; height:150px; border-radius:50%; background:#ddd; display:flex; align-items:center; justify-content:center; color:#666; font-weight:bold; margin-bottom:10px;">Немає аватара</div>`;
+
+        res.send(`
+            <h1>👤 Профіль користувача</h1>
+            <a href="/notes">← До нотаток</a> | <a href="/">На головну</a>
+            <hr>
+            
+            <div style="margin-bottom: 20px;">
+                ${avatarHtml}
+                <p><b>Ваш Email:</b> ${user.email}</p>
+                <p><b>Ваш логін:</b> ${req.session.username}</p>
+            </div>
+
+            <hr>
+            <h3>Завантажити новий аватар (макс. 2МБ, тільки JPEG/PNG/WebP):</h3>
+            <form action="/profile/avatar" method="POST" enctype="multipart/form-data">
+                <input type="file" name="avatar" accept="image/*" required><br><br>
+                <button type="submit">Оновити аватарку</button>
+            </form>
+
+            ${user.avatar ? `
+                <br>
+                <form action="/profile/avatar/delete" method="POST">
+                    <button type="submit" style="color:red;">Видалити аватарку ❌</button>
+                </form>
+            ` : ''}
+        `);
+    } catch (err) {
+        res.status(500).send("Помилка завантаження профілю: " + err.message);
+    }
+});
+
+// 2. ОБРОБКА ЗАВАНТАЖЕННЯ АВАТАРА
+app.post("/profile/avatar", requireAuth, (req, res) => {
+    uploadAvatar.single('avatar')(req, res, async (err) => {
+        if (err instanceof multer.MulterError) {
+            if (err.code === 'LIMIT_FILE_SIZE') {
+                return res.status(400).send("Помилка: Файл занадто великий! Максимальний розмір — 2 МБ.");
+            }
+            return res.status(400).send("Помилка завантаження: " + err.message);
+        } else if (err) {
+            return res.status(400).send(err.message);
+        }
+
+        if (!req.file) {
+            return res.status(400).send("Будь ласка, виберіть файл для завантаження.");
+        }
+
+        try {
+            const userId = req.session.userId;
+            const userResult = await pool.query("SELECT avatar FROM users WHERE id = $1", [userId]);
+            const oldAvatar = userResult.rows[0].avatar;
+
+            if (oldAvatar) {
+                const oldPath = path.join(__dirname, 'uploads', 'avatars', oldAvatar);
+                await fs.unlink(oldPath).catch(() => console.log("Старий файл не знайдено на диску"));
+            }
+
+            await pool.query("UPDATE users SET avatar = $1 WHERE id = $2", [req.file.filename, userId]);
+            res.redirect("/profile");
+        } catch (dbErr) {
+            res.status(500).send("Помилка збереження в БД: " + dbErr.message);
+        }
+    });
+});
+
+// 3. ВИДАЛЕННЯ АВАТАРА
+app.post("/profile/avatar/delete", requireAuth, async (req, res) => {
+    try {
+        const userId = req.session.userId;
+        const userResult = await pool.query("SELECT avatar FROM users WHERE id = $1", [userId]);
+        const currentAvatar = userResult.rows[0].avatar;
+
+        if (currentAvatar) {
+            const filePath = path.join(__dirname, 'uploads', 'avatars', currentAvatar);
+            await fs.unlink(filePath).catch(() => console.log("Файл на диску не знайдено"));
+            await pool.query("UPDATE users SET avatar = NULL WHERE id = $1", [userId]);
+        }
+        res.redirect("/profile");
+    } catch (err) {
+        res.status(500).send("Помилка видалення аватара: " + err.message);
+    }
+});
+
+
+// ==========================================
+// ЛАБА №6: МАРШРУТИ ДЛЯ ІМПОРТУ НОТАТОК (JSON)
+// ==========================================
+
+// 1. ФОРМА ІМПОРТУ
+app.get("/notes/import", requireAuth, (req, res) => {
+    res.send(`
+        <h1>📥 Імпорт нотаток з JSON</h1>
+        <a href="/notes">← Назад до списку нотаток</a>
+        <hr>
+        <p>Виберіть файл у форматі <b>.json</b>, який містить масив нотаток.</p>
+        <p>Приклад структури файлу:</p>
+        <pre style="background: #eee; padding: 10px; inline-size: max-content; border-radius: 5px;">
+[
+  { "title": "Купити хліб", "content": "Молоко, батон, сир" },
+  { "title": "Важливе завдання", "content": "Зробити лабораторну роботу №6" }
+]
+        </pre>
+        <br>
+        <form action="/notes/import" method="POST" enctype="multipart/form-data">
+            <input type="file" name="importFile" accept=".json" required><br><br>
+            <button type="submit">Почати імпорт 🚀</button>
+        </form>
+    `);
+});
+
+// 2. ОБРОБКА ЗАВАНТАЖЕННЯ ТА ІМПОРТУ (ТРАНЗАКЦІЯ)
+app.post("/notes/import", requireAuth, (req, res) => {
+    uploadImport.single('importFile')(req, res, async (err) => {
+        if (err instanceof multer.MulterError) {
+            if (err.code === 'LIMIT_FILE_SIZE') {
+                return res.status(400).send("Помилка: Файл занадто великий! Максимальний розмір JSON — 1 МБ.");
+            }
+            return res.status(400).send("Помилка файлу: " + err.message);
+        } else if (err) {
+            return res.status(400).send(err.message);
+        }
+
+        if (!req.file) {
+            return res.status(400).send("Будь ласка, виберіть JSON файл для імпорту.");
+        }
+
+        const client = await pool.connect();
+        try {
+            // Читаємо вміст завантаженого файлу з диска
+            const fileContent = await fs.readFile(req.file.path, 'utf-8');
+            const notesArray = JSON.parse(fileContent);
+
+            // Перевіряємо, чи це дійсно масив
+            if (!Array.isArray(notesArray)) {
+                throw new Error("Некоректний формат JSON. Корінь файлу повинен бути масивом `[]`.");
+            }
+
+            const userId = req.session.userId;
+
+            // --- ЗАПУСКАЄМО SQL ТРАНЗАКЦІЮ ---
+            await client.query('BEGIN');
+
+            for (let note of notesArray) {
+                if (!note.title || !note.content) {
+                    throw new Error("Кожна нотатка в JSON повинна мати обов'язкові поля 'title' та 'content'!");
+                }
+                
+                // Вставляємо нотатку в базу
+                await client.query(
+                    "INSERT INTO notes (title, content, user_id) VALUES ($1, $2, $3)",
+                    [note.title, note.content, userId]
+                );
+            }
+
+            // Якщо все пройшло успішно — зберігаємо зміни в базі даних
+            await client.query('COMMIT');
+
+            // Видаляємо тимчасовий файл з диска, бо дані вже в базі
+            await fs.unlink(req.file.path).catch(() => {});
+
+            res.send(`
+                <h1 style="color: green;">🎉 Імпорт завершено успішно!</h1>
+                <p>Усі нотатки (кількість: <b>${notesArray.length}</b>) були імпортовані в базу даних за допомогою транзакції.</p>
+                <br>
+                <a href="/notes" style="font-size: 18px; font-weight: bold;">← Перейти до списку нотаток</a>
+            `);
+
+        } catch (processErr) {
+            // Якщо сталася будь-яка помилка — повністю відкочуємо транзакцію!
+            await client.query('ROLLBACK');
+            
+            // Видаляємо тимчасовий файл з диска у разі невдачі
+            if (req.file && req.file.path) {
+                await fs.unlink(req.file.path).catch(() => {});
+            }
+
+            res.status(400).send(`
+                <h1 style="color: red;">❌ Помилка імпорту (Транзакція скасована)</h1>
+                <p>Жодна нотатка не була додана в базу даних.</p>
+                <p><b>Причина помилки:</b> ${processErr.message}</p>
+                <br>
+                <a href="/notes/import">Спробувати ще раз</a>
+            `);
+        } finally {
+            client.release();
+        }
+    });
+});
+
+
+// --- МАРШРУТИ ДЛЯ НОТАТОК (Лаби 1-5) ---
+
+// 1. СТАТИСТИКА
 app.get("/notes/stats", requireAuth, async (req, res) => {
     try {
         const userId = req.session.userId;
@@ -148,7 +417,9 @@ app.get("/notes", requireAuth, async (req, res) => {
             </form>
 
             <a href="/notes/new">+ Додати нотатку</a> | 
+            <a href="/notes/import" style="color: green; font-weight: bold;">Імпорт JSON 📥</a> | 
             <a href="/notes/stats">Статистика 📊</a> |
+            <a href="/profile">Мій Профіль 👤</a> |
             <a href="/notes/export.csv?search=${search}&period=${period}&sort=${sort}">Export CSV 📥</a> |
             <a href="/">На головну</a>
             <hr>
@@ -244,7 +515,7 @@ app.get("/notes/export.csv", requireAuth, async (req, res) => {
     } catch (err) { res.status(500).send("Помилка експорту"); }
 });
 
-// 6. Видалення
+// 6. Видалення нотатки
 app.post("/notes/:id/delete", requireAuth, async (req, res) => {
     try {
         await pool.query("DELETE FROM notes WHERE id = $1 AND user_id = $2", [req.params.id, req.session.userId]);
@@ -252,11 +523,13 @@ app.post("/notes/:id/delete", requireAuth, async (req, res) => {
     } catch (err) { res.status(500).send("Помилка видалення: " + err.message); }
 });
 
+// ГОЛОВНА СТОРІНКА
 app.get("/", requireAuth, function (req, res) {
     res.send(`
         <h1>Вітаємо, ${req.session.username}!</h1>
         <p>Ви успішно увійшли в систему.</p>
-        <a href="/notes" style="font-size: 20px; font-weight: bold;">Перейти до моїх нотаток 📝</a>
+        <a href="/notes" style="font-size: 20px; font-weight: bold;">Перейти до моїх нотаток 📝</a><br><br>
+        <a href="/profile" style="font-size: 16px;">Перейти в Профіль (Аватарка) 👤</a>
         <br><br>
         <form action="/auth/logout" method="POST">
             <button type="submit">Вийти</button>
