@@ -1,8 +1,16 @@
+const rateLimit = require('express-rate-limit');
 const express = require("express");
 const router = express.Router();
 const bcrypt = require("bcryptjs");
 const pool = require("./db");
 
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 хвилин
+  max: 10, // максимум 10 спроб
+  message: 'Забагато спроб входу. Спробуйте через 15 хвилин.',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 // Форма реєстрації (тимчасова, поки немає EJS)
 router.get("/register", (req, res) => {
   res.send(`
@@ -49,7 +57,7 @@ router.get("/login", (req, res) => {
 });
 
 // Вхід користувача
-router.post("/login", async (req, res) => {
+router.post("/login", loginLimiter, async (req, res) => {
   const { email, password } = req.body;
   try {
     const userResult = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
